@@ -13,9 +13,9 @@ const { chromium } = require('playwright');
     // --- LOGIN FLOW ---
     console.log("Starting Login Flow...");
     try {
-        const loginUrl = "https://services2.passportindia.gov.in/forms/PreLogin";
+        const loginUrl = "https://services1.passportindia.gov.in/forms/PreLogin";
         console.log(`Navigating to Login Page: ${loginUrl}...`);
-        await page.goto(loginUrl, { timeout: 60000 });
+        await page.goto(loginUrl, { waitUntil: 'networkidle', timeout: 60000 });
 
         // Step 1: Login ID
         console.log("Entering Login ID...");
@@ -25,56 +25,70 @@ const { chromium } = require('playwright');
 
         console.log("Clicking Continue...");
 
-        // Setup wait for response BEFORE clicking
+        // Setup wait for preLogin API response BEFORE clicking
         const preLoginPromise = page.waitForResponse(response =>
             response.url().includes('/preLogin') && response.request().method() === 'POST'
             , { timeout: 20000 }).catch(e => {
-                console.error(`preLogin API response timeout: ${e.message}`);
+                console.log(`preLogin API response timeout: ${e.message}`);
                 return null;
             });
 
         await page.locator('div[data-focusable="true"]').filter({ hasText: 'Continue' }).click();
 
-        console.log('Waiting for preLogin API response...');
-        const preLoginResponse = await preLoginPromise;
-        if (preLoginResponse) {
-            console.log(`preLogin Response Status: ${preLoginResponse.status()}`);
+        console.log("Waiting for preLogin API response...");
+        try {
+            const preLoginResponse = await preLoginPromise;
+            if (preLoginResponse) {
+                console.log(`preLogin Response Status: ${preLoginResponse.status()}`);
+            }
+        } catch (e) {
+            console.log(`Error waiting for preLogin: ${e.message}`);
         }
 
         // Allow UI to update after API response
         await page.waitForTimeout(2000);
 
-        // Step 2: Handle Second Page Transition
-        console.log('Waiting for second page load (Login ID or Password field)...');
-        const loginIdSelector = 'input[type="text"]';
-        const passwordSelector = 'input[type="password"]';
+        // Step 2: Handle Second Page Transition - Dynamic Detection
+        console.log("Waiting for second page load (Login ID or Password field)...");
 
-        const firstFound = await Promise.race([
-            page.waitForSelector(loginIdSelector, { state: 'visible', timeout: 20000 }).then(() => 'loginId'),
-            page.waitForSelector(passwordSelector, { state: 'visible', timeout: 20000 }).then(() => 'password')
-        ]);
+        try {
+            const loginIdSelector = 'input[type="text"]';
+            const passwordSelector = 'input[type="password"]';
 
-        console.log(`Second page loaded. Found element: ${firstFound}`);
+            // Wait for *either* field to appear
+            const firstFound = await Promise.race([
+                page.waitForSelector(loginIdSelector, { state: 'visible', timeout: 20000 }).then(() => 'loginId'),
+                page.waitForSelector(passwordSelector, { state: 'visible', timeout: 20000 }).then(() => 'password')
+            ]);
 
-        if (firstFound === 'loginId') {
-            // Check if Login ID needs re-entry
-            const loginInput = page.locator(loginIdSelector).first();
-            const val = await loginInput.inputValue();
-            if (!val) {
-                console.log('Login ID field is empty. Re-entering...');
-                await loginInput.fill(LOGIN_ID);
-            } else {
-                console.log('Login ID preserved.');
+            console.log(`Second page loaded. Found element: ${firstFound}`);
+
+            if (firstFound === 'loginId') {
+                // Check if it's empty
+                const loginInputField = page.locator(loginIdSelector).first();
+                const val = await loginInputField.inputValue();
+                if (!val) {
+                    console.log("Login ID field is empty. Re-entering...");
+                    await loginInputField.fill(LOGIN_ID);
+                } else {
+                    console.log("Login ID preserved.");
+                }
+
+                // If we found Login ID, Password might not be visible yet
+                if (!await page.locator(passwordSelector).isVisible()) {
+                    await page.waitForSelector(passwordSelector, { timeout: 10000 });
+                }
             }
 
-            // Wait for password field if not visible yet
-            if (!await page.locator(passwordSelector).isVisible()) {
-                await page.waitForSelector(passwordSelector, { timeout: 10000 });
-            }
+        } catch (e) {
+            console.error(`Timeout waiting for second page elements: ${e.message}`);
+            throw e;
         }
 
+        // Step 2: Enter Password
         console.log("Entering Password...");
-        await page.locator(passwordSelector).fill(PASSWORD);
+        const passwordInput = page.locator('input[type="password"]');
+        await passwordInput.fill(PASSWORD);
 
         console.log("Clicking Sign In...");
         const signInButton = page.locator('div[data-focusable="true"]').filter({ hasText: 'Sign In' }).first();
@@ -82,30 +96,61 @@ const { chromium } = require('playwright');
         await signInButton.click();
 
         // --- LOGIN VERIFICATION & TIMEOUT HANDLING ---
-        // User requested manual intervention support.
-        console.log("Login submitted. Verifying successful login...");
+        console.log("Login submitted. Waiting for login to process...");
 
-        // We wait for a clear sign of being logged in.
-        // If it fails, we pause indefinitely (well, long enough) for manual user action.
+        // Wait for navigation to complete after Sign In
+        console.log("Waiting for navigation after Sign In...");
         try {
-            await Promise.race([
-                page.waitForSelector('text=Logout', { timeout: 10000 }),
-                page.waitForSelector('text=Services', { timeout: 10000 })
-            ]);
-            console.log(">>> LOGIN SUCCESSFUL (Automated) <<<");
+            await page.waitForURL(url =>
+                url.includes('homeScreen') ||
+                url.includes('Services') ||
+                url.includes('applicantHome') ||
+                url.includes('dashboard'),
+                { timeout: 40000 } // Increased from 20s to 40s - login takes time
+            );
         } catch (e) {
-            console.error(">>> LOGIN AUTO-CHECK FAILED <<<");
-            console.log("PAUSING for 60 seconds to allow manual login/CAPTCHA fix...");
-            console.log("Please interact with the browser window to complete login.");
+            console.log("URL wait timed out, checking current URL...");
+        }
 
-            // Wait for user to manually reach the dashboard
+        // Additional wait to ensure page is stable
+        await page.waitForTimeout(5000); // Increased from 3s to 5s
+
+        const currentUrl = page.url();
+        console.log(`Current URL after login attempt: ${currentUrl}`);
+
+        // Check for success indicators
+        if (currentUrl.includes('applicantHome') || currentUrl.includes('dashboard') || currentUrl.includes('Services') || currentUrl.includes('homeScreen')) {
+            console.log(">>> LOGIN SUCCESSFUL (Automated) <<<");
+        } else {
+            // Fallback: try to detect success elements
             try {
-                await page.waitForSelector('text=Logout', { timeout: 60000 });
-                console.log(">>> MANUAL LOGIN DETECTED. Proceeding... <<<");
-            } catch (manualError) {
-                console.error("Manual login timed out. Script might fail from here.");
+                await Promise.race([
+                    page.waitForSelector('text=Logout', { timeout: 10000 }),
+                    page.waitForSelector('text=Services', { timeout: 10000 })
+                ]);
+                console.log(">>> LOGIN SUCCESSFUL (Automated) <<<");
+            } catch (e) {
+                console.error(">>> LOGIN AUTO-CHECK FAILED <<<");
+                console.log("PAUSING for 60 seconds to allow manual login/CAPTCHA fix...");
+                console.log("Please interact with the browser window to complete login.");
+
+                // Wait for user to manually reach the dashboard
+                try {
+                    await page.waitForSelector('text=Logout', { timeout: 60000 });
+                    console.log(">>> MANUAL LOGIN DETECTED. Proceeding... <<<");
+                } catch (manualError) {
+                    console.error("Manual login timed out. Script might fail from here.");
+                }
             }
         }
+
+        // Add visualization delay after successful login
+        console.log("Login successful. Pausing for visualization...");
+        await page.waitForTimeout(2000);
+
+        // Ensure page is fully loaded
+        await page.waitForLoadState('networkidle');
+        console.log("Page fully loaded after login.");
 
     } catch (e) {
         console.error("Login failed:", e);
@@ -116,25 +161,46 @@ const { chromium } = require('playwright');
     console.log("Navigating to 'Apply for Fresh Passport'...");
 
     try {
-        // Go directly to Home to ensure clean state
-        // Attempting to find the link directly on the Dashboard Home
-        const linkSelector = 'a:has-text("Fresh Passport/Re-Issue of Passport")';
+        const currentUrl = page.url();
+        console.log(`Current page: ${currentUrl}`);
 
-        // If we are not on Home, goto Home/Services to find it
-        if (!await page.locator(linkSelector).first().isVisible()) {
-            console.log("Link not visible, ensuring we are on Services page...");
-            await page.goto('https://services2.passportindia.gov.in/forms/Home/Services');
-            await page.waitForLoadState('networkidle');
+        // If we're on homeScreen, click the Services tab instead of navigating
+        if (currentUrl.includes('homeScreen')) {
+            console.log("On homeScreen, clicking Services tab...");
+            try {
+                const servicesTab = page.getByText('Services', { exact: true }).first();
+                await servicesTab.waitFor({ state: 'visible', timeout: 5000 });
+                await servicesTab.click();
+                await page.waitForLoadState('networkidle');
+                await page.waitForTimeout(2000);
+                console.log("Services tab clicked successfully.");
+            } catch (e) {
+                console.log("Services tab not found, trying direct navigation...");
+                // Only use goto as last resort, and use waitUntil to prevent page closure
+                await page.goto('https://services1.passportindia.gov.in/forms/Home/Services', {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 30000
+                });
+                await page.waitForLoadState('networkidle');
+                await page.waitForTimeout(2000);
+            }
         }
+
+        // Now look for the Fresh Passport link
+        const linkSelector = 'a:has-text("Fresh Passport/Re-Issue of Passport")';
+        console.log("Looking for Fresh Passport link...");
 
         // Close any advisory modal if it pops up *now*
         const closeButton = page.locator('.close, button[aria-label="Close"], button:has-text("Close"), span:has-text("X")');
         if (await closeButton.count() > 0 && await closeButton.first().isVisible()) {
             await closeButton.first().click();
+            await page.waitForTimeout(1000);
         }
 
         console.log("Clicking 'Apply for Fresh Passport/Re-Issue of Passport'...");
         await page.locator(linkSelector).first().click();
+        await page.waitForLoadState('networkidle');
+        await page.waitForTimeout(2000); // Visualization delay
 
         // 2. Handle AutoPopulate (Skip) if it appears
         try {
@@ -143,6 +209,8 @@ const { chromium } = require('playwright');
             await skipButton.waitFor({ state: 'visible', timeout: 3000 });
             if (await skipButton.isVisible()) {
                 await skipButton.click();
+                await page.waitForLoadState('networkidle');
+                await page.waitForTimeout(1000);
             }
         } catch (e) { /* Ignore if not present */ }
 
@@ -158,12 +226,15 @@ const { chromium } = require('playwright');
                     await rpoSelect.first().selectOption({ index: 1 });
                 }
                 await page.locator('text=Next').click();
+                await page.waitForLoadState('networkidle');
+                await page.waitForTimeout(2000);
             }
         } catch (e) { }
 
         // 4. Passport Type Selection
         console.log("Handling 'Passport Type' form...");
         await page.waitForSelector('text=Fresh Passport', { timeout: 30000 });
+        await page.waitForTimeout(1000); // Allow form to render
 
         // Radio buttons often don't have standard IDs here, using text approximation
         await page.getByText('Fresh Passport').first().click();
@@ -172,6 +243,8 @@ const { chromium } = require('playwright');
 
         console.log("Clicking 'Save and Next'...");
         await page.locator('text=Save and Next').click();
+        await page.waitForLoadState('networkidle');
+        await page.waitForTimeout(2000); // Visualization delay
 
     } catch (e) {
         console.error("Navigation error:", e);
@@ -181,6 +254,7 @@ const { chromium } = require('playwright');
     console.log("Waiting for 'Applicant Details' form...");
     try {
         await page.waitForSelector("text=Applicant Details", { timeout: 30000 });
+        await page.waitForTimeout(1500); // Allow form to fully load
         console.log("In 'Applicant Details' form.");
 
         // 1. Given Name & Surname
@@ -274,6 +348,8 @@ const { chromium } = require('playwright');
 
         console.log("Saving 'Applicant Details'...");
         await page.locator('text=Save and Next').click();
+        await page.waitForLoadState('networkidle');
+        await page.waitForTimeout(2000); // Visualization delay
 
     } catch (e) {
         console.error("Error in Applicant Details:", e);
@@ -283,6 +359,7 @@ const { chromium } = require('playwright');
     console.log("Waiting for 'Family Details' form...");
     try {
         await page.waitForSelector("text=Family Details", { timeout: 30000 });
+        await page.waitForTimeout(1500); // Allow form to fully load
 
         // 1. Father's Name
         console.log("Filling Father details...");
@@ -300,6 +377,8 @@ const { chromium } = require('playwright');
 
         console.log("Saving 'Family Details'...");
         await page.locator('text=Save and Next').click();
+        await page.waitForLoadState('networkidle');
+        await page.waitForTimeout(2000); // Visualization delay
 
     } catch (e) {
         console.error("Error in Family Details:", e);
