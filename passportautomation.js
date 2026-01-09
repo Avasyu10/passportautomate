@@ -533,6 +533,18 @@ const { chromium } = require('playwright');
 
         console.log("Saving 'Address Details'...");
         await page.locator('text=Save and Next').click();
+
+        // Handle potential confirmation popup ("OK" button)
+        try {
+            console.log("Waiting for Address confirmation popup...");
+            const okButton = page.locator('button:has-text("OK"), input[type="button"][value="OK"]').first();
+            await okButton.waitFor({ state: 'visible', timeout: 5000 });
+            await okButton.click();
+            console.log("Clicked 'OK' on Address confirmation popup");
+        } catch (e) {
+            console.log("No Address confirmation popup appeared or it was dismissed automatically");
+        }
+
         await page.waitForLoadState('networkidle');
         await page.waitForTimeout(2000); // Visualization delay
 
