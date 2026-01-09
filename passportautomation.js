@@ -2,12 +2,10 @@ const { chromium } = require('playwright');
 
 (async () => {
     // --- CONFIGURATION ---
-    // --- CONFIGURATION ---
     const LOGIN_ID = "yash.hooda@unifyapps.com";
     const PASSWORD = "Hooda@3784";
 
     // Launch the browser
-    // headless: false so you can see the automation in action
     const browser = await chromium.launch({ headless: false });
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -15,7 +13,7 @@ const { chromium } = require('playwright');
     // --- LOGIN FLOW ---
     console.log("Starting Login Flow...");
     try {
-        const loginUrl = "https://services1.passportindia.gov.in/forms/PreLogin";
+        const loginUrl = "https://services2.passportindia.gov.in/forms/PreLogin";
         console.log(`Navigating to Login Page: ${loginUrl}...`);
         await page.goto(loginUrl, { timeout: 60000 });
 
@@ -26,401 +24,290 @@ const { chromium } = require('playwright');
         await loginInput.fill(LOGIN_ID);
 
         console.log("Clicking Continue...");
+
+        // Setup wait for response BEFORE clicking
+        const preLoginPromise = page.waitForResponse(response =>
+            response.url().includes('/preLogin') && response.request().method() === 'POST'
+            , { timeout: 20000 }).catch(e => {
+                console.error(`preLogin API response timeout: ${e.message}`);
+                return null;
+            });
+
         await page.locator('div[data-focusable="true"]').filter({ hasText: 'Continue' }).click();
 
-        // Step 2: Password
-        console.log("Waiting for Password Step...");
-        const passwordInput = page.locator('input[type="password"]');
-        await passwordInput.waitFor({ state: 'visible', timeout: 10000 });
-
-        console.log("Entering Password...");
-        await passwordInput.fill(PASSWORD);
-
-        console.log("Clicking Sign In...");
-        await page.locator('text=Sign In').last().click();
-
-        console.log("Login submitted. Verifying successful login...");
-
-        // Wait for either the Dashboard (Logout button) OR a Login Failure message/return to login
-        // We look for 'Logout' or 'Services' which indicate we are inside.
-        try {
-            await Promise.race([
-                page.waitForSelector('text=Logout', { timeout: 15000 }),
-                page.waitForSelector('text=Services', { timeout: 15000 }),
-                page.waitForSelector('text=User ID', { timeout: 15000 }) // Back at login?
-            ]);
-        } catch (e) {
-            console.log("Timed out waiting for login transition.");
+        console.log('Waiting for preLogin API response...');
+        const preLoginResponse = await preLoginPromise;
+        if (preLoginResponse) {
+            console.log(`preLogin Response Status: ${preLoginResponse.status()}`);
         }
 
-        // Check where we are
-        if (await page.locator('text=Logout').isVisible() || await page.locator('text=Services').first().isVisible()) {
-            console.log(">>> LOGIN SUCCESSFUL <<<");
-        } else {
-            console.error(">>> LOGIN FAILED or CAPTCHA REQUIRED <<<");
-            console.log("Taking screenshot of login failure...");
-            await page.screenshot({ path: 'login_failure_debug.png' });
-            console.log("Calculated failure. PAUSING for 30 seconds to allow manual login...");
-            // Allow user to manually fix the login (e.g. enter captcha)
-            await page.waitForTimeout(30000);
+        // Allow UI to update after API response
+        await page.waitForTimeout(2000);
 
-            // Re-check
-            if (await page.locator('text=Logout').isVisible()) {
-                console.log("Manual recover successful. Proceeding...");
+        // Step 2: Handle Second Page Transition
+        console.log('Waiting for second page load (Login ID or Password field)...');
+        const loginIdSelector = 'input[type="text"]';
+        const passwordSelector = 'input[type="password"]';
+
+        const firstFound = await Promise.race([
+            page.waitForSelector(loginIdSelector, { state: 'visible', timeout: 20000 }).then(() => 'loginId'),
+            page.waitForSelector(passwordSelector, { state: 'visible', timeout: 20000 }).then(() => 'password')
+        ]);
+
+        console.log(`Second page loaded. Found element: ${firstFound}`);
+
+        if (firstFound === 'loginId') {
+            // Check if Login ID needs re-entry
+            const loginInput = page.locator(loginIdSelector).first();
+            const val = await loginInput.inputValue();
+            if (!val) {
+                console.log('Login ID field is empty. Re-entering...');
+                await loginInput.fill(LOGIN_ID);
             } else {
-                throw new Error("Could not log in even after pause.");
+                console.log('Login ID preserved.');
+            }
+
+            // Wait for password field if not visible yet
+            if (!await page.locator(passwordSelector).isVisible()) {
+                await page.waitForSelector(passwordSelector, { timeout: 10000 });
             }
         }
 
-        await page.waitForLoadState('networkidle');
+        console.log("Entering Password...");
+        await page.locator(passwordSelector).fill(PASSWORD);
+
+        console.log("Clicking Sign In...");
+        const signInButton = page.locator('div[data-focusable="true"]').filter({ hasText: 'Sign In' }).first();
+        await signInButton.waitFor({ state: 'visible', timeout: 10000 });
+        await signInButton.click();
+
+        // --- LOGIN VERIFICATION & TIMEOUT HANDLING ---
+        // User requested manual intervention support.
+        console.log("Login submitted. Verifying successful login...");
+
+        // We wait for a clear sign of being logged in.
+        // If it fails, we pause indefinitely (well, long enough) for manual user action.
+        try {
+            await Promise.race([
+                page.waitForSelector('text=Logout', { timeout: 10000 }),
+                page.waitForSelector('text=Services', { timeout: 10000 })
+            ]);
+            console.log(">>> LOGIN SUCCESSFUL (Automated) <<<");
+        } catch (e) {
+            console.error(">>> LOGIN AUTO-CHECK FAILED <<<");
+            console.log("PAUSING for 60 seconds to allow manual login/CAPTCHA fix...");
+            console.log("Please interact with the browser window to complete login.");
+
+            // Wait for user to manually reach the dashboard
+            try {
+                await page.waitForSelector('text=Logout', { timeout: 60000 });
+                console.log(">>> MANUAL LOGIN DETECTED. Proceeding... <<<");
+            } catch (manualError) {
+                console.error("Manual login timed out. Script might fail from here.");
+            }
+        }
 
     } catch (e) {
         console.error("Login failed:", e);
-        throw e;
+        // We continue anyway because the user might have fixed it or wants to see the failure
     }
 
     // --- Post-Login Navigation ---
-    console.log("Navigating via Dashboard Links...");
+    console.log("Navigating to 'Apply for Fresh Passport'...");
 
     try {
-        // CHECK FOR ADVISORY MODAL
-        console.log("Checking for Advisor/Overlay...");
-        const closeSelectors = [
-            '.close',
-            'button[aria-label="Close"]',
-            'button:has-text("Close")',
-            'span:has-text("X")',
-            'div[class*="modal"] button'
-        ];
+        // Go directly to Home to ensure clean state
+        // Attempting to find the link directly on the Dashboard Home
+        const linkSelector = 'a:has-text("Fresh Passport/Re-Issue of Passport")';
 
-        for (const selector of closeSelectors) {
-            if (await page.locator(selector).first().isVisible()) {
-                console.log(`Creating/Closing overlay with selector: ${selector}`);
-                await page.locator(selector).first().click();
-                await page.waitForTimeout(500);
-                break;
-            }
+        // If we are not on Home, goto Home/Services to find it
+        if (!await page.locator(linkSelector).first().isVisible()) {
+            console.log("Link not visible, ensuring we are on Services page...");
+            await page.goto('https://services2.passportindia.gov.in/forms/Home/Services');
+            await page.waitForLoadState('networkidle');
         }
 
-        // 1. Navigate directly to Services (Bypassing Sidebar click)
-        console.log("Navigating directly to Services page to skip sidebar issues...");
-        // Using the URL from the user's screenshot directly
-        await page.goto('https://services1.passportindia.gov.in/forms/Home/Services');
-        await page.waitForLoadState('networkidle');
+        // Close any advisory modal if it pops up *now*
+        const closeButton = page.locator('.close, button[aria-label="Close"], button:has-text("Close"), span:has-text("X")');
+        if (await closeButton.count() > 0 && await closeButton.first().isVisible()) {
+            await closeButton.first().click();
+        }
 
-        // 2. Click 'Apply for Fresh Passport/Re-Issue of Passport'
-        console.log("Selecting 'Apply for Fresh Passport'...");
+        console.log("Clicking 'Apply for Fresh Passport/Re-Issue of Passport'...");
+        await page.locator(linkSelector).first().click();
 
-        const applyText = page.getByText('Fresh Passport/Re-Issue of Passport');
-        await applyText.first().waitFor({ state: 'visible', timeout: 30000 });
-        await applyText.first().click();
-
-        // 3. Handle AutoPopulate (Skip)
-        console.log("Checking for AutoPopulate/Skip step...");
+        // 2. Handle AutoPopulate (Skip) if it appears
         try {
+            // Quick check for Skip button
             const skipButton = page.locator('text=Skip For Now');
-            await skipButton.waitFor({ state: 'visible', timeout: 5000 });
+            await skipButton.waitFor({ state: 'visible', timeout: 3000 });
             if (await skipButton.isVisible()) {
-                console.log("Clicking 'Skip For Now'...");
                 await skipButton.click();
             }
-        } catch (e) {
-            console.log("AutoPopulate step skipped (not found).");
-        }
+        } catch (e) { /* Ignore if not present */ }
 
         // 3. RPO Selection
-        console.log("Waiting for RPO Selection...");
-        await page.waitForSelector('select', { timeout: 30000 });
-
-        console.log("Selecting RPO...");
-        const rpoSelect = page.locator('select').first();
-
-        // List options to debug if it fails
-        // const options = await rpoSelect.innerText();
-        // console.log("Available RPOs:", options);
-
+        console.log("Handling RPO Selection...");
+        // It might be skipped if already selected? Check presence.
         try {
-            await rpoSelect.selectOption({ label: 'Delhi' });
-            console.log("Selected 'Delhi'");
-        } catch (e) {
-            console.log("Could not select 'Delhi', selecting index 1...");
-            await rpoSelect.selectOption({ index: 1 });
-        }
-
-        console.log("Clicking Next...");
-        await page.locator('text=Next').click();
+            const rpoSelect = page.locator('select');
+            if (await rpoSelect.first().isVisible()) {
+                try {
+                    await rpoSelect.first().selectOption({ label: 'Delhi' });
+                } catch (e) {
+                    await rpoSelect.first().selectOption({ index: 1 });
+                }
+                await page.locator('text=Next').click();
+            }
+        } catch (e) { }
 
         // 4. Passport Type Selection
-        console.log("Waiting for Passport Type Selection...");
-        await page.waitForSelector('text=Fresh Passport', { visible: true, timeout: 30000 });
+        console.log("Handling 'Passport Type' form...");
+        await page.waitForSelector('text=Fresh Passport', { timeout: 30000 });
 
-        console.log("Selecting Passport Details...");
-        // Use partial text clicks which are robust for radio labels
+        // Radio buttons often don't have standard IDs here, using text approximation
         await page.getByText('Fresh Passport').first().click();
-        await page.getByText('Normal', { exact: true }).first().click(); // 'Normal' might be common, exact ensures we don't hit 'Tatkaal' desc
+        await page.getByText('Normal', { exact: true }).first().click();
         await page.getByText('36 Pages').first().click();
 
         console.log("Clicking 'Save and Next'...");
         await page.locator('text=Save and Next').click();
 
     } catch (e) {
-        console.error("Error during Post-Login Navigation:", e);
-        console.log("Taking failure screenshot...");
-        await page.screenshot({ path: 'post_login_failure.png' });
-        console.log("Screenshot saved to post_login_failure.png");
+        console.error("Navigation error:", e);
     }
 
-    // --- Applicant Details ---
-    console.log("Waiting for Applicant Details form...");
+    // --- APPLICANT DETAILS ---
+    console.log("Waiting for 'Applicant Details' form...");
     try {
-        await page.waitForLoadState("networkidle");
-        // Verify we are on the form
-        await page.waitForSelector('text=Applicant Details', { timeout: 30000 });
-    } catch (e) {
-        console.log("Wait for Applicant Details failed or timed out.");
-    }
+        await page.waitForSelector("text=Applicant Details", { timeout: 30000 });
+        console.log("In 'Applicant Details' form.");
 
-    // --- Applicant Details ---
+        // 1. Given Name & Surname
+        console.log("Filling Name...");
+        // Attempts generic label first, then specific inputs if common
+        await page.getByLabel("Given Name").first().fill("Rahul");
+        await page.getByLabel("Surname").first().fill("Garg");
 
-    try {
-        // Given Name
-        console.log("Filling Given Name...");
-        await page.getByLabel("Given Name").fill("Rahul");
+        // 2. Gender
+        console.log("Selecting Gender (Male)...");
+        // Using visible text for Radio Label
+        await page.locator('label:has-text("Male")').first().click();
 
-        // Surname
-        console.log("Filling Surname...");
-        await page.getByLabel("Surname").fill("Garg");
+        // 3. Have you ever been known by other names (aliases)? -> No
+        console.log("Aliases -> No");
+        await page.locator('tr:has-text("known by other names")').locator('label:has-text("No")').click();
 
-        // Gender
-        // Assuming labels or values. Using text locator for label as fallback.
-        console.log("Selecting Gender...");
-        // Strategy: Look for the label text "Gender" and finding 'Male' near it, or just generic 'Male' label if unique enough
-        const maleRadio = page.getByLabel("Male", { exact: true });
-        if (await maleRadio.isVisible()) {
-            await maleRadio.check();
-        } else {
-            // Fallback: try to find by value or ID if we could guess, but let's try a visual layout relative locator
-            // If standard labels don't work, might need to click the label element itself
-            await page.locator('label:has-text("Male")').click();
+        // 4. Have you ever changed your name? -> No
+        console.log("Name Change -> No");
+        await page.locator('tr:has-text("changed your name")').locator('label:has-text("No")').click();
+
+        // 5. Date of Birth
+        console.log("Filling DOB...");
+        // Try filling directly first
+        try {
+            await page.getByLabel("Date of Birth").fill("01/01/1990");
+        } catch (e) {
+            // Fallback to click and type
+            await page.getByLabel("Date of Birth").click();
+            await page.keyboard.type("01/01/1990");
         }
+        await page.keyboard.press("Tab");
 
-        // Have you ever been known by other names (aliases)?
-        console.log("Answering Aliases question...");
-        await page.locator("tr", { hasText: "Have you ever been known by other names" }).getByLabel("No").check();
-
-        // Have you ever changed your name?
-        console.log("Answering Name Change question...");
-        await page.locator("tr", { hasText: "Have you ever changed your name" }).getByLabel("No").check();
-
-        // Date of Birth (DD/MM/YYYY)
-        console.log("Filling Date of Birth...");
-        await page.getByLabel("Date of Birth").click();
-        await page.getByLabel("Date of Birth").fill("01/01/1990");
-        await page.getByLabel("Date of Birth").press("Tab");
-
-        // Place of Birth (Village/Town/City)
+        // 6. Place of Birth
         console.log("Filling Place of Birth...");
-        await page.getByLabel("Place of Birth").first().fill("New Delhi"); // .first() in case of duplicates
+        await page.getByLabel("Place of Birth").first().fill("New Delhi");
 
-        // Is your Place of Birth out of India?
-        console.log("Answering Place of Birth out of India...");
-        await page.locator("tr", { hasText: "Is your Place of Birth out of India" }).getByLabel("No").check();
+        // 7. Is Place of Birth out of India? -> No
+        console.log("Place of Birth out of India -> No");
+        await page.locator('tr:has-text("Place of Birth out of India")').locator('label:has-text("No")').click();
 
-        // Marital Status
-        console.log("Selecting Marital Status...");
+        // 8. Marital Status
+        console.log("Selecting Marital Status -> Single");
         await page.getByLabel("Marital Status").selectOption({ label: "Single" });
 
-        // Citizenship of India by
-        console.log("Selecting Citizenship...");
+        // 9. Citizenship of India by -> Birth
+        console.log("Selecting Citizenship -> Birth");
         await page.getByLabel("Citizenship of India by").selectOption({ label: "Birth" });
 
-        // PAN (if available)
-        console.log("Filling PAN...");
+        // 10. PAN & Voter ID
+        console.log("Filling PAN/Voter Optional...");
         await page.getByLabel("PAN").fill("ABCDE1234F");
-
-        // Voter Id (if available)
-        console.log("Filling Voter Id...");
         await page.getByLabel("Voter Id").fill("XYZ1234567");
 
-        // Employment Type
-        console.log("Selecting Employment Type...");
+        // 11. Employment Type -> Private
+        console.log("Employment Type -> Private");
         await page.getByLabel("Employment Type").selectOption({ label: "Private" });
 
-        // Is either of your parent... government servant?
-        console.log("Answering Parent Government Servant...");
-        // Note: The text might be slightly different or split, using a substring
-        await page.locator("tr", { hasText: "government servant" }).getByLabel("No").check();
+        // 12. Parent/Spouse Gov Servant? -> No
+        console.log("Gov Servant -> No");
+        // Text is "Is either of your parent (in case of minor)/spouse, a government servant?"
+        await page.locator('tr:has-text("government servant")').locator('label:has-text("No")').click();
 
-        // Educational Qualification
-        console.log("Selecting Educational Qualification...");
+        // 13. Educational Qualification -> Graduate
+        console.log("Education -> Graduate");
         await page.getByLabel("Educational Qualification").selectOption({ label: "Graduate" });
 
-        // Is applicant eligible for Non-ECR category?
-        console.log("Answering Non-ECR...");
-        await page.locator("tr", { hasText: "Is applicant eligible for Non-ECR" }).getByLabel("Yes").check();
+        // 14. Non-ECR -> Yes
+        console.log("Non-ECR -> Yes");
+        // "Is applicant eligible for Non-ECR category?"
+        await page.locator('tr:has-text("Non-ECR")').locator('label:has-text("Yes")').click();
 
-        // Visible distinguishing mark
-        console.log("Filling Visible distinguishing mark...");
+        // 15. Visible Distinguishing Mark
+        console.log("Visible Mark -> None");
         await page.getByLabel("Visible distinguishing mark").fill("None");
 
-        // Aadhaar Number
-        console.log("Filling Aadhaar Number...");
+        // 16. Aadhaar Number
+        console.log("Aadhaar -> ...");
         await page.getByLabel("Aadhaar Number").fill("123456789012");
 
-        // Consent Agreement
-        console.log("Checking Consent Agreement...");
-        // "I Agree" might be in a label or associated with "Yes"
-        // Finding the section with the long consent text
-        const consentSection = page.locator("div, td", { hasText: "I, the holder of above mentioned Aadhaar Number" }).first();
-        // Assuming there is a "Yes" radio or check button inside/near it
-        // Or sometimes it's just "I Agree" -> Yes
-        if (await consentSection.isVisible()) {
-            await consentSection.getByLabel("Yes").check();
+        // 17. Consent -> Yes
+        console.log("Consent -> Yes");
+        // Often 'I Agree' -> Yes. Searching for the consent box section
+        const consentBox = page.locator('text=I Agree').first();
+        if (await consentBox.isVisible()) {
+            // Look for a radio/checkbox near it
+            await page.locator('label:has-text("Yes")').last().click();
         } else {
-            // Fallback: look for generic "I Agree" section options
-            await page.locator('label:has-text("Yes")').last().check();
+            await page.locator('label:has-text("Yes")').last().click();
         }
 
-        console.log("Forms filled. Keeping browser open for 10 seconds...");
-        await page.waitForTimeout(10000);
+        console.log("Saving 'Applicant Details'...");
+        await page.locator('text=Save and Next').click();
 
-        // Uncomment to click save
-        console.log("Saving Applicant Details and moving to Family Details...");
-        await page.getByRole("button", { name: "Save and Next" }).click();
+    } catch (e) {
+        console.error("Error in Applicant Details:", e);
+    }
 
-        // --- Family Details ---
-        console.log("Waiting for Family Details page...");
-        // Wait for the URL to change or a specific element on the new page
-        try {
-            await page.waitForURL(/.*FamilyDetails.*/, { timeout: 30000 });
-        } catch (e) {
-            console.log("URL didn't change as expected or timed out, checking for 'Family Details' text presence...");
-        }
+    // --- FAMILY DETAILS ---
+    console.log("Waiting for 'Family Details' form...");
+    try {
+        await page.waitForSelector("text=Family Details", { timeout: 30000 });
 
-        // Ensure we are on the right page
-        await page.waitForSelector("text=Family Details", { timeout: 10000 });
-
-        console.log("Filling Father's/Legal Guardian's Details...");
-        // Father's Given Name
+        // 1. Father's Name
+        console.log("Filling Father details...");
         await page.getByLabel("Father's/Legal Guardian's Given Name").fill("FatherName");
-        // Father's Surname (Using nth(0) assuming it's the first Surname field on this page)
-        // Alternatively, locate by visual proximity if structure allows
         await page.getByLabel("Surname").nth(0).fill("FatherSurname");
 
-        console.log("Filling Mother's Details...");
-        // Mother's Given Name
+        // 2. Mother's Name
+        console.log("Filling Mother details...");
         await page.getByLabel("Mother's Given Name").fill("MotherName");
-        // Mother's Surname (Using nth(1))
         await page.getByLabel("Surname").nth(1).fill("MotherSurname");
 
-        console.log("Filling Legal Guardian's Details (if applicable)...");
-        // Legal Guardian's Given Name
-        await page.getByLabel("Legal Guardian's Given Name").fill(""); // Leaving empty or "GuardianName"
-        // Legal Guardian's Surname (Using nth(2))
-        await page.getByLabel("Surname").nth(2).fill("");
+        // 3. Legal Guardian (Optional)
+        // console.log("Filling Legal Guardian...");
+        // await page.getByLabel("Legal Guardian's Given Name").fill("");
 
-        console.log("Family Details filled. Keeping browser open for 10 seconds...");
-        await page.waitForTimeout(10000);
+        console.log("Saving 'Family Details'...");
+        await page.locator('text=Save and Next').click();
 
-        // Uncomment to click save for this page too
-        console.log("Saving Family Details and moving to Address Details...");
-        await page.getByRole("button", { name: "Save and Next" }).click();
-
-        // --- Address Details ---
-        console.log("Waiting for Address Details page...");
-        // Wait for the URL to change or a specific element on the new page
-        try {
-            await page.waitForURL(/.*AddressDetails.*/, { timeout: 30000 });
-        } catch (e) {
-            console.log("URL didn't change as expected or timed out, checking for 'Address Details' text presence...");
-        }
-
-        // Ensure we are on the right page
-        await page.waitForSelector("text=Address Details", { timeout: 10000 });
-
-        console.log("Filling Address Details...");
-
-        // Is your present address out of India?
-        // Assuming "No" for typical application, modify logic if "Yes" needed
-        await page.locator("tr", { hasText: "Is your present address out of India" }).getByLabel("No").check();
-
-        // House No. and Street Name
-        await page.getByLabel("House No. and Street Name").fill("123, Some Street");
-
-        // Village/Town/City
-        await page.getByLabel("Village/Town/City").fill("Some City");
-
-        // PIN Code
-        await page.getByLabel("PIN Code").fill("110001");
-
-        // Mobile Number (Without Country Code)
-        await page.getByLabel("Mobile Number").fill("9999999999");
-        // Sometimes it's labelled slightly vaguely, let's try visual if generic text
-        // await page.getByRole('textbox', { name: "Mobile Number" }).fill("9876543210");
-
-        // Telephone Number
-        await page.getByLabel("Telephone Number").fill("0112345678");
-
-        // E-mail Id
-        await page.getByLabel("E-mail Id").fill("example@email.com");
-
-        // Is permanent address available?
-        // Let's say "Yes"
-        await page.locator("tr", { hasText: "Is Permanent Address available" }).getByLabel("Yes").check();
-
-        // If Yes, it might ask "Is your permanent address same as present address?"
-        // We'll wait a brief moment for that to appear if it's dynamic
-        // await page.waitForTimeout(1000); // optional pause
-        // Checking "Yes" for same address to avoid filling it again
-        const sameAddressQuestion = page.locator("tr", { hasText: "Is your permanent address same as present address" });
-        if (await sameAddressQuestion.isVisible()) {
-            await sameAddressQuestion.getByLabel("Yes").check();
-        }
-
-        console.log("Address Details filled. Keeping browser open for 10 seconds...");
-        await page.waitForTimeout(10000);
-
-        // Uncomment to click save for this page too
-        console.log("Saving Address Details and moving to Emergency Contact...");
-        await page.getByRole("button", { name: "Save and Next" }).click();
-
-        // --- Emergency Contact ---
-        console.log("Waiting for Emergency Contact page...");
-        try {
-            await page.waitForURL(/.*EmergencyContact.*/, { timeout: 30000 });
-        } catch (e) {
-            console.log("URL didn't change as expected or timed out, checking for 'Emergency Contact' text presence...");
-        }
-
-        // Ensure we are on the right page
-        // "Emergency Contact" usually appears in the header or step indicator
-        await page.waitForSelector("text=Emergency Contact", { timeout: 10000 });
-
-        console.log("Filling Emergency Contact Details...");
-
-        // Name and Address
-        await page.getByLabel("Name and Address").fill("Emergency Person Name, 456 Another St, City");
-
-        // Mobile Number (Without Country Code)
-        await page.getByLabel("Mobile Number").first().fill("9876543210");
-        // using .first() because sometimes "Mobile Number" might match the previous step header or similar if visible, 
-        // though on a clean page it should be unique.
-
-        // Telephone Number
-        await page.getByLabel("Telephone Number").fill("0118765432");
-
-        // E-mail Id
-        await page.getByLabel("E-mail Id").fill("emergency@email.com");
-
-        console.log("Emergency Contact filled. Keeping browser open for 10 seconds...");
-        await page.waitForTimeout(10000);
-
-        // Uncomment to click save
-        // await page.getByRole("button", { name: "Save and Next" }).click();
-
-    } catch (error) {
-        console.error("An error occurred during the script execution:", error);
-    } finally {
-        await browser.close();
+    } catch (e) {
+        console.error("Error in Family Details:", e);
     }
+
+    // Pause to let user see
+    console.log("Script finished family details. Pausing...");
+    await page.waitForTimeout(60000);
+
+    await browser.close();
 })();
